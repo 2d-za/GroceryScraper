@@ -129,21 +129,38 @@ def word_variants(word: str) -> list[str]:
     return list(forms)
 
 
+def word_hits(name: str, require: list[str]) -> int:
+    low = normalize_for_match(name)
+    return sum(1 for r in require if any(f in low for f in word_variants(r)))
+
+
+def min_required_hits(require: list[str]) -> int:
+    """Retailers are inconsistent about including generic category words
+    (e.g. PnP calls it "Lemon Creams", Checkers/Woolworths "...Cream
+    Biscuits" — "biscuits" just isn't in PnP's name at all). Requiring every
+    single word therefore misses real matches. Tolerate exactly one missing
+    word once the query is descriptive enough (3+ words) that losing one
+    still leaves enough to be confident; short/brand-only queries still need
+    a full match since there's nothing to spare."""
+    return len(require) if len(require) <= 2 else len(require) - 1
+
+
 def offer_matches(name: str, require: list[str], exclude: list[str]) -> bool:
     low = normalize_for_match(name)
-    require_forms = [word_variants(r) for r in require]
     exclude_forms = [f for e in exclude for f in word_variants(e)]
-    return (
-        all(any(f in low for f in forms) for forms in require_forms)
-        and not any(f in low for f in exclude_forms)
-    )
+    if any(f in low for f in exclude_forms):
+        return False
+    return word_hits(name, require) >= min_required_hits(require)
 
 
 def pick_best_match(offers: list[Offer], require: list[str], exclude: list[str]) -> Offer | None:
-    for offer in offers:
-        if offer_matches(offer.name, require, exclude):
-            return offer
-    return None
+    candidates = [o for o in offers if offer_matches(o.name, require, exclude)]
+    if not candidates:
+        return None
+    # Prefer the offer matching the most words, not just the first qualifying
+    # one — relevant once a missing word is tolerated, so a full match always
+    # outranks a partial one when both are present.
+    return max(candidates, key=lambda o: word_hits(o.name, require))
 
 
 SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)(kg|g|ml|l)\b")
