@@ -48,31 +48,37 @@ USER_AGENT = (
 )
 
 # We only ever read text/attributes out of the DOM, never look at images or
-# render anything visually, so these are pure dead weight. Blocking them
-# also means three concurrent pages aren't competing for bandwidth with junk
-# they don't need.
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
-BLOCKED_HOST_SNIPPETS = (
-    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
-    "connect.facebook.net", "facebook.net", "hotjar.com", "criteo.com",
-    "criteo.net", "outbrain.com", "taboola.com", "newrelic.com",
-    "nr-data.net", "clarity.ms", "mypurecloud",
+# render anything visually, so these are pure dead weight.
+#
+# Routed as two narrow patterns rather than one "**/*" catch-all: Playwright
+# only round-trips a request through our async handler when its URL actually
+# matches the route pattern, so a catch-all means *every* request on *every*
+# concurrent page (search API calls, scripts, the document itself — things
+# we always let through anyway) pays that round-trip. Under three pages
+# scraping at once that overhead compounds and was causing exactly the kind
+# of intermittent, load-dependent slowness/timeouts seen on image-heavy
+# result pages (a broad query like "bakers" pulls in far more product images
+# than a narrow one). Scoping the pattern to only what we might actually
+# block lets everything else bypass our handler entirely.
+BLOCKED_EXTENSIONS_RE = re.compile(
+    r"\.(png|jpe?g|gif|webp|svg|ico|bmp|woff2?|ttf|eot|mp4|webm|avif)(\?|$)", re.I
+)
+BLOCKED_HOSTS_RE = re.compile(
+    r"(google-analytics\.com|googletagmanager\.com|doubleclick\.net|"
+    r"connect\.facebook\.net|facebook\.net|hotjar\.com|criteo\.(com|net)|"
+    r"outbrain\.com|taboola\.com|newrelic\.com|nr-data\.net|clarity\.ms|mypurecloud)",
+    re.I,
 )
 
 
-async def block_unnecessary_requests(route):
-    request = route.request
-    if request.resource_type in BLOCKED_RESOURCE_TYPES or any(
-        host in request.url for host in BLOCKED_HOST_SNIPPETS
-    ):
-        await route.abort()
-    else:
-        await route.continue_()
+async def abort_request(route):
+    await route.abort()
 
 
 async def new_page(browser) -> Page:
     page = await browser.new_page(user_agent=USER_AGENT, viewport={"width": 1400, "height": 1200})
-    await page.route("**/*", block_unnecessary_requests)
+    await page.route(BLOCKED_EXTENSIONS_RE, abort_request)
+    await page.route(BLOCKED_HOSTS_RE, abort_request)
     return page
 
 
