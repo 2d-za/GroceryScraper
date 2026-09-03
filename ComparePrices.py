@@ -63,9 +63,20 @@ def normalize(text: str) -> str:
     return "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
 
 
+# Retailers abbreviate the same qualifier differently (e.g. Woolworths' "100 pk"
+# vs Checkers/PnP's "100 Pack"). Map known abbreviations to a shared form
+# before whitespace is stripped, so a query for one still matches the other.
+WORD_SYNONYMS = {
+    "pk": "pack",
+    "pkt": "pack",
+    "pkts": "pack",
+}
+
+
 def normalize_for_match(text: str) -> str:
     # Also drop whitespace so "200g" matches Woolworths' "200 g".
-    return re.sub(r"\s+", "", normalize(text))
+    words = [WORD_SYNONYMS.get(w, w) for w in normalize(text).split()]
+    return "".join(words)
 
 
 def pick_best_match(offers: list[Offer], require: list[str], exclude: list[str]) -> Offer | None:
@@ -143,7 +154,7 @@ def scrape_checkers(page, query: str, address: str) -> list[Offer]:
                 const whole = card.querySelector("[class*='price-display_full']");
                 const cents = card.querySelector("[class*='price-display_half']");
                 const promo = card.querySelector('[class*=product-card_promotion]');
-                const label = promo ? promo.textContent.trim() : '';
+                const label = promo ? (promo.innerText || '').trim() : '';
                 return {
                     price: whole && cents ? whole.textContent.trim() + cents.textContent.trim() : null,
                     dealLabel: label || null,
@@ -313,6 +324,29 @@ def print_comparison(label: str, all_offers: dict[str, list[Offer]], require: li
             print(f"Also on deal: {offer.retailer} at R{offer.price:.2f} [{offer.deal_label}]")
 
 
+def search_with_fallback(scraper, page, product: str, address: str, require: list[str], exclude: list[str]) -> list[Offer]:
+    """Some sites' own search boxes handle certain phrasings (extra qualifier
+    words, pack counts, etc.) poorly and return nothing useful even though the
+    product exists. If the first search doesn't produce a client-side match,
+    retry once with the last word dropped (repeated down to two words)."""
+    offers = scraper(page, product, address)
+    if pick_best_match(offers, require, exclude):
+        return offers
+
+    words = product.split()
+    while len(words) > 2:
+        words = words[:-1]
+        fallback_query = " ".join(words)
+        try:
+            fallback_offers = scraper(page, fallback_query, address)
+        except Exception:
+            continue
+        offers = offers + fallback_offers
+        if pick_best_match(offers, require, exclude):
+            break
+    return offers
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare a grocery product's price across Checkers, Pick n Pay, and Woolworths."
@@ -346,7 +380,7 @@ def main():
             print(f"Checking {retailer} ...")
             page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1400, "height": 1200})
             try:
-                all_offers[retailer] = scraper(page, product, address)
+                all_offers[retailer] = search_with_fallback(scraper, page, product, address, require, exclude)
             except Exception as e:
                 print(f"  {retailer} scrape failed: {e}", file=sys.stderr)
                 all_offers[retailer] = []
