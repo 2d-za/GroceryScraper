@@ -79,12 +79,32 @@ def normalize_for_match(text: str) -> str:
     return "".join(words)
 
 
+def word_variants(word: str) -> list[str]:
+    """Alternate spellings a plain substring check would otherwise miss:
+    singular/plural forms ("cream" vs "creams", "berries" vs "berry"), since
+    retailers are inconsistent about which one they use in product names."""
+    base = normalize_for_match(word)
+    forms = {base}
+    if base.endswith("ies") and len(base) > 4:
+        forms.add(base[:-3] + "y")
+    if base.endswith("s") and len(base) > 3:
+        forms.add(base[:-1])
+    return list(forms)
+
+
+def offer_matches(name: str, require: list[str], exclude: list[str]) -> bool:
+    low = normalize_for_match(name)
+    require_forms = [word_variants(r) for r in require]
+    exclude_forms = [f for e in exclude for f in word_variants(e)]
+    return (
+        all(any(f in low for f in forms) for forms in require_forms)
+        and not any(f in low for f in exclude_forms)
+    )
+
+
 def pick_best_match(offers: list[Offer], require: list[str], exclude: list[str]) -> Offer | None:
-    require = [normalize_for_match(r) for r in require]
-    exclude = [normalize_for_match(e) for e in exclude]
     for offer in offers:
-        low = normalize_for_match(offer.name)
-        if all(r in low for r in require) and not any(e in low for e in exclude):
+        if offer_matches(offer.name, require, exclude):
             return offer
     return None
 
@@ -101,14 +121,11 @@ def rank_sizes(all_offers: dict[str, list[Offer]], require: list[str], exclude: 
     """Pack sizes among offers matching require/exclude, ranked by how many
     different stores carry that size (most useful for cross-store comparison)
     and, as a tiebreak, how often it shows up overall."""
-    req = [normalize_for_match(r) for r in require]
-    exc = [normalize_for_match(e) for e in exclude]
     stores_by_size: dict[str, set] = {}
     counts: Counter[str] = Counter()
     for retailer, offers in all_offers.items():
         for offer in offers:
-            low = normalize_for_match(offer.name)
-            if not all(r in low for r in req) or any(e in low for e in exc):
+            if not offer_matches(offer.name, require, exclude):
                 continue
             size = extract_size(offer.name)
             if size:
