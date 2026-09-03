@@ -11,6 +11,13 @@ headless browser (Playwright) rather than plain HTTP requests:
     price on a promotion may still differ from the "SAVE"/limited-item deal
     price shown in the promo badge.
 
+The three stores are scraped concurrently (each gets its own page, all
+sharing one browser), and each page blocks images/fonts/media and known
+analytics/ad trackers to cut network noise — both because we never look at
+those resources and because they were measurably slowing down Checkers'
+and Pick n Pay's `networkidle` wait (trackers keep firing in the
+background, which resets the "quiet" timer networkidle waits for).
+
 Run it with no arguments and it will prompt for a delivery address and a
 product to search for. If the product doesn't mention a size (e.g. just
 "Jacobs Gold Instant Coffee" instead of "...200g"), it compares the two
@@ -25,18 +32,48 @@ Usage:
 """
 
 import argparse
+import asyncio
 import re
 import sys
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeoutError
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+# We only ever read text/attributes out of the DOM, never look at images or
+# render anything visually, so these are pure dead weight. Blocking them
+# also means three concurrent pages aren't competing for bandwidth with junk
+# they don't need.
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+BLOCKED_HOST_SNIPPETS = (
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "connect.facebook.net", "facebook.net", "hotjar.com", "criteo.com",
+    "criteo.net", "outbrain.com", "taboola.com", "newrelic.com",
+    "nr-data.net", "clarity.ms", "mypurecloud",
+)
+
+
+async def block_unnecessary_requests(route):
+    request = route.request
+    if request.resource_type in BLOCKED_RESOURCE_TYPES or any(
+        host in request.url for host in BLOCKED_HOST_SNIPPETS
+    ):
+        await route.abort()
+    else:
+        await route.continue_()
+
+
+async def new_page(browser) -> Page:
+    page = await browser.new_page(user_agent=USER_AGENT, viewport={"width": 1400, "height": 1200})
+    await page.route("**/*", block_unnecessary_requests)
+    return page
 
 
 @dataclass
@@ -48,10 +85,10 @@ class Offer:
     url: str | None
 
 
-def accept_cookies(page):
+async def accept_cookies(page: Page) -> None:
     for text in ["Accept", "Accept All", "Accept All Cookies", "I Accept"]:
         try:
-            page.click(f"text={text}", timeout=3000)
+            await page.click(f"text={text}", timeout=3000)
             return
         except PWTimeoutError:
             continue
@@ -136,15 +173,53 @@ def rank_sizes(all_offers: dict[str, list[Offer]], require: list[str], exclude: 
     return sizes[:limit]
 
 
-def scrape_checkers(page, query: str, address: str) -> list[Offer]:
-    page.goto("https://www.checkers.co.za/", wait_until="networkidle", timeout=30000)
-    accept_cookies(page)
+CHECKERS_EXTRACT_JS = """
+() => Array.from(document.querySelectorAll("a[data-testid$='-product-card-link']")).map(a => {
+    const card = a.closest('[class*=product-card_card]');
+    const whole = card && card.querySelector("[class*='price-display_full']");
+    const cents = card && card.querySelector("[class*='price-display_half']");
+    const promo = card && card.querySelector('[class*=product-card_promotion]');
+    return {
+        name: a.getAttribute('aria-label') || '',
+        href: a.getAttribute('href') || '',
+        price: (whole && cents) ? (whole.textContent.trim() + cents.textContent.trim()) : null,
+        dealLabel: promo ? (promo.innerText || '').trim() : null,
+    };
+})
+"""
 
-    page.click("text=Enter your address", timeout=10000)
-    page.wait_for_timeout(800)
+
+def _build_checkers_offers(raw: list[dict]) -> list[Offer]:
+    offers = []
+    for item in raw:
+        name = (item.get("name") or "").strip()
+        price_text = item.get("price")
+        if not name or not price_text:
+            continue
+        price = float(re.sub(r"[^\d.]", "", price_text))
+        href = item.get("href") or ""
+        offers.append(Offer(
+            retailer="Checkers",
+            name=name,
+            price=price,
+            deal_label=item.get("dealLabel") or None,
+            url=f"https://www.checkers.co.za{href}" if href.startswith("/") else (href or None),
+        ))
+    return offers
+
+
+async def scrape_checkers(
+    page: Page, query: str, address: str,
+    require: list[str] | None = None, exclude: list[str] | None = None,
+) -> list[Offer]:
+    await page.goto("https://www.checkers.co.za/", wait_until="networkidle", timeout=30000)
+    await accept_cookies(page)
+
+    await page.click("text=Enter your address", timeout=10000)
+    await page.wait_for_timeout(800)
     addr_input = page.locator("input[type='text']").first
-    addr_input.click()
-    addr_input.type(address, delay=80)
+    await addr_input.click()
+    await addr_input.type(address, delay=80)
 
     # Scoped to the actual autocomplete dropdown (an unscoped "li, [role=option]"
     # locator also matches unrelated <li> elements elsewhere on the page, e.g.
@@ -154,119 +229,101 @@ def scrape_checkers(page, query: str, address: str) -> list[Offer]:
     suggestion = page.locator(
         "[class*='address-search_address-dropdown'] li[class*='prediction-list-item']"
     ).first
-    suggestion.wait_for(state="visible", timeout=10000)
-    suggestion.click(timeout=8000)
-    page.wait_for_timeout(1500)
+    await suggestion.wait_for(state="visible", timeout=10000)
+    await suggestion.click(timeout=8000)
+    await page.wait_for_timeout(1500)
 
     search_box = page.locator("input[placeholder*='Search']").first
-    search_box.click()
-    search_box.fill(query)
-    search_box.press("Enter")
-    page.wait_for_timeout(4000)
+    await search_box.click()
+    await search_box.fill(query)
+    await search_box.press("Enter")
+    try:
+        await page.wait_for_selector("a[data-testid$='-product-card-link']", timeout=15000)
+    except PWTimeoutError:
+        return []
 
     # Checkers lazy-loads results via infinite scroll — often only ~16-20 of
     # potentially hundreds of matches are in the DOM until you scroll, so a
     # relevant product ranked just past that first batch would be missed.
-    links = page.locator("a[data-testid$='-product-card-link']")
+    # Extraction runs in-browser as a single batched call each pass (rather
+    # than one round-trip per card), and if we already have a confident
+    # match we stop scrolling immediately instead of loading everything.
+    offers: list[Offer] = []
     previous_count = -1
     for _ in range(6):
-        current_count = links.count()
-        if current_count == previous_count:
+        raw = await page.evaluate(CHECKERS_EXTRACT_JS)
+        offers = _build_checkers_offers(raw)
+        if require is not None and pick_best_match(offers, require, exclude or []):
             break
-        previous_count = current_count
-        page.mouse.wheel(0, 4000)
-        page.wait_for_timeout(1200)
+        if len(raw) == previous_count:
+            break
+        previous_count = len(raw)
+        await page.mouse.wheel(0, 4000)
+        await page.wait_for_timeout(1200)
 
-    offers = []
-    for i in range(links.count()):
-        link = links.nth(i)
-        name = link.get_attribute("aria-label") or ""
-        href = link.get_attribute("href") or ""
-        info = link.evaluate(
-            """
-            e => {
-                const card = e.closest('[class*=product-card_card]');
-                if (!card) return null;
-                const whole = card.querySelector("[class*='price-display_full']");
-                const cents = card.querySelector("[class*='price-display_half']");
-                const promo = card.querySelector('[class*=product-card_promotion]');
-                const label = promo ? (promo.innerText || '').trim() : '';
-                return {
-                    price: whole && cents ? whole.textContent.trim() + cents.textContent.trim() : null,
-                    dealLabel: label || null,
-                };
-            }
-            """
-        )
-        if not name or not info or not info["price"]:
-            continue
-        price = float(re.sub(r"[^\d.]", "", info["price"]))
-        offers.append(Offer(
-            retailer="Checkers",
-            name=name.strip(),
-            price=price,
-            deal_label=info["dealLabel"],
-            url=f"https://www.checkers.co.za{href}" if href.startswith("/") else (href or None),
-        ))
     return offers
 
 
-def scrape_pnp(page, query: str) -> list[Offer]:
-    page.goto("https://www.pnp.co.za/", wait_until="networkidle", timeout=30000)
-    accept_cookies(page)
-    page.wait_for_timeout(800)
+PNP_EXTRACT_JS = """
+() => Array.from(document.querySelectorAll('div.product-grid-item')).map(card => {
+    const promoBox = card.querySelector('.product-grid-item__promotion-container.has-value #promotion');
+    const badge = card.querySelector('[class*=group4-badge] li, [class*=group4-badge]');
+    const link = card.querySelector('a.product-grid-item__info-container__name');
+    return {
+        name: card.getAttribute('aria-label') || '',
+        desc: card.getAttribute('aria-description') || '',
+        promoPrice: promoBox ? promoBox.textContent.trim() : null,
+        badgeLabel: badge ? (badge.getAttribute('title') || badge.textContent.trim()) : null,
+        href: link ? link.getAttribute('href') : null,
+    };
+})
+"""
+
+
+async def scrape_pnp(page: Page, query: str, *_ignored) -> list[Offer]:
+    await page.goto("https://www.pnp.co.za/", wait_until="networkidle", timeout=30000)
+    await accept_cookies(page)
+    await page.wait_for_timeout(800)
     try:
-        page.click("text=Do this later", timeout=5000)
+        await page.click("text=Do this later", timeout=5000)
     except PWTimeoutError:
         pass
-    page.wait_for_timeout(800)
+    await page.wait_for_timeout(800)
 
     search_box = page.locator("input[placeholder*='Search']").first
-    search_box.click()
-    search_box.fill(query)
-    search_box.press("Enter")
-    page.wait_for_timeout(4000)
+    await search_box.click()
+    await search_box.fill(query)
+    await search_box.press("Enter")
+    try:
+        await page.wait_for_selector("div.product-grid-item", timeout=15000)
+    except PWTimeoutError:
+        return []
 
-    cards = page.locator("div.product-grid-item")
+    raw = await page.evaluate(PNP_EXTRACT_JS)
     offers = []
-    for i in range(cards.count()):
-        card = cards.nth(i)
-        name = card.get_attribute("aria-label") or ""
-        desc = card.get_attribute("aria-description") or ""
+    for item in raw:
+        name = (item.get("name") or "").strip()
+        desc = item.get("desc") or ""
         m = re.search(r"([\d.]+)\s*rands", desc)
         if not name or not m:
             continue
         regular_price = float(m.group(1))
 
-        info = card.evaluate(
-            """
-            e => {
-                const promoBox = e.querySelector('.product-grid-item__promotion-container.has-value #promotion');
-                const badge = e.querySelector('[class*=group4-badge] li, [class*=group4-badge]');
-                const link = e.querySelector('a.product-grid-item__info-container__name');
-                return {
-                    promoPrice: promoBox ? promoBox.textContent.trim() : null,
-                    badgeLabel: badge ? (badge.getAttribute('title') || badge.textContent.trim()) : null,
-                    href: link ? link.getAttribute('href') : null,
-                };
-            }
-            """
-        )
         deal_price = None
-        if info["promoPrice"]:
-            pm = re.search(r"[\d.]+", info["promoPrice"])
+        if item.get("promoPrice"):
+            pm = re.search(r"[\d.]+", item["promoPrice"])
             if pm:
                 deal_price = float(pm.group(0))
 
         price = deal_price if deal_price is not None else regular_price
         deal_label = None
         if deal_price is not None and deal_price < regular_price:
-            deal_label = info["badgeLabel"] or "On promotion"
+            deal_label = item.get("badgeLabel") or "On promotion"
 
-        href = info["href"] or ""
+        href = item.get("href") or ""
         offers.append(Offer(
             retailer="Pick n Pay",
-            name=name.strip(),
+            name=name,
             price=price,
             deal_label=deal_label,
             url=f"https://www.pnp.co.za{href}" if href.startswith("/") else (href or None),
@@ -274,43 +331,46 @@ def scrape_pnp(page, query: str) -> list[Offer]:
     return offers
 
 
-def scrape_woolworths(page, query: str) -> list[Offer]:
-    url = f"https://www.woolworths.co.za/browse?searchterm={query.replace(' ', '%20')}&fr=1"
-    page.goto(url, timeout=30000, wait_until="domcontentloaded")
-    page.wait_for_timeout(3000)
-    accept_cookies(page)
-    page.wait_for_timeout(3000)
+WOOLWORTHS_EXTRACT_JS = """
+() => Array.from(document.querySelectorAll("[data-testid='product-card']")).map(card => {
+    const promo = card.querySelector("[data-testid='product-card-promotion']");
+    return {
+        name: card.getAttribute('data-cnstrc-item-name'),
+        price: card.getAttribute('data-cnstrc-item-price'),
+        dealLabel: promo ? (promo.innerText || '').trim() : null,
+    };
+})
+"""
 
-    cards = page.locator("[data-testid='product-card']")
+
+async def scrape_woolworths(page: Page, query: str, *_ignored) -> list[Offer]:
+    url = f"https://www.woolworths.co.za/browse?searchterm={query.replace(' ', '%20')}&fr=1"
+    await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+    await accept_cookies(page)
+    try:
+        await page.wait_for_selector("[data-testid='product-card']", timeout=15000)
+    except PWTimeoutError:
+        return []
+
+    raw = await page.evaluate(WOOLWORTHS_EXTRACT_JS)
     offers = []
-    for i in range(cards.count()):
-        card = cards.nth(i)
-        data = card.evaluate(
-            """
-            e => ({
-                name: e.getAttribute('data-cnstrc-item-name'),
-                price: e.getAttribute('data-cnstrc-item-price'),
-            })
-            """
-        )
-        if not data["name"] or not data["price"]:
+    for item in raw:
+        if not item.get("name") or not item.get("price"):
             continue
-        promo = card.locator("[data-testid='product-card-promotion']")
-        deal_label = promo.inner_text().strip() if promo.count() > 0 else None
         offers.append(Offer(
             retailer="Woolworths",
-            name=re.sub(r"\s+", " ", data["name"]).strip(),
-            price=float(data["price"]),
-            deal_label=deal_label,
+            name=re.sub(r"\s+", " ", item["name"]).strip(),
+            price=float(item["price"]),
+            deal_label=item.get("dealLabel") or None,
             url=url,
         ))
     return offers
 
 
 SCRAPERS = {
-    "Checkers": lambda page, query, address: scrape_checkers(page, query, address),
-    "Pick n Pay": lambda page, query, address: scrape_pnp(page, query),
-    "Woolworths": lambda page, query, address: scrape_woolworths(page, query),
+    "Checkers": scrape_checkers,
+    "Pick n Pay": scrape_pnp,
+    "Woolworths": scrape_woolworths,
 }
 
 DEFAULT_ADDRESS = "1 Sandton Drive, Sandton"
@@ -360,12 +420,21 @@ def print_comparison(label: str, all_offers: dict[str, list[Offer]], require: li
             print(f"Also on deal: {offer.retailer} at R{offer.price:.2f} [{offer.deal_label}]")
 
 
-def search_with_fallback(scraper, page, product: str, address: str, require: list[str], exclude: list[str]) -> list[Offer]:
+async def search_with_fallback(
+    scraper, page: Page, product: str, address: str, require: list[str], exclude: list[str],
+    scroll_require: list[str] | None, scroll_exclude: list[str] | None,
+) -> list[Offer]:
     """Some sites' own search boxes handle certain phrasings (extra qualifier
     words, pack counts, etc.) poorly and return nothing useful even though the
     product exists. If the first search doesn't produce a client-side match,
-    retry once with the last word dropped (repeated down to two words)."""
-    offers = scraper(page, product, address)
+    retry once with the last word dropped (repeated down to two words).
+
+    scroll_require/scroll_exclude are separate from require/exclude: they
+    control Checkers' early-exit-while-scrolling and must be None whenever
+    the caller still needs the *full* result set (e.g. ranking pack sizes
+    for a query with no size named) — otherwise stopping at the first match
+    would starve that ranking of everything past it."""
+    offers = await scraper(page, product, address, scroll_require, scroll_exclude)
     if pick_best_match(offers, require, exclude):
         return offers
 
@@ -374,13 +443,54 @@ def search_with_fallback(scraper, page, product: str, address: str, require: lis
         words = words[:-1]
         fallback_query = " ".join(words)
         try:
-            fallback_offers = scraper(page, fallback_query, address)
+            fallback_offers = await scraper(page, fallback_query, address, scroll_require, scroll_exclude)
         except Exception:
             continue
         offers = offers + fallback_offers
         if pick_best_match(offers, require, exclude):
             break
     return offers
+
+
+async def run_retailer(browser, retailer: str, scraper, product: str, address: str,
+                        require: list[str], exclude: list[str],
+                        scroll_require: list[str] | None, scroll_exclude: list[str] | None) -> tuple[str, list[Offer]]:
+    print(f"Checking {retailer} ...")
+    start = time.monotonic()
+    page = await new_page(browser)
+    try:
+        offers = await search_with_fallback(
+            scraper, page, product, address, require, exclude, scroll_require, scroll_exclude
+        )
+    except Exception as e:
+        print(f"  {retailer} scrape failed: {e}", file=sys.stderr)
+        offers = []
+    finally:
+        await page.close()
+    elapsed = time.monotonic() - start
+    print(f"  {retailer} done in {elapsed:.1f}s ({len(offers)} offers)")
+    return retailer, offers
+
+
+async def run(product: str, address: str, require: list[str], exclude: list[str]) -> dict[str, list[Offer]]:
+    # Only let Checkers stop scrolling early when the query already names a
+    # size — otherwise the later "no size specified" size-ranking needs to
+    # see the full result set, not just whatever loaded before the first
+    # (size-agnostic) match.
+    has_size = extract_size(product) is not None
+    scroll_require = require if has_size else None
+    scroll_exclude = exclude if has_size else None
+
+    start = time.monotonic()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        results = await asyncio.gather(*(
+            run_retailer(browser, retailer, scraper, product, address, require, exclude, scroll_require, scroll_exclude)
+            for retailer, scraper in SCRAPERS.items()
+        ))
+        await browser.close()
+    print(f"All stores checked in {time.monotonic() - start:.1f}s")
+    return dict(results)
 
 
 def main():
@@ -409,20 +519,7 @@ def main():
     require = args.require if args.require is not None else re.findall(r"\w+", normalize(product))
     exclude = args.exclude
 
-    all_offers: dict[str, list[Offer]] = {}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        for retailer, scraper in SCRAPERS.items():
-            print(f"Checking {retailer} ...")
-            page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1400, "height": 1200})
-            try:
-                all_offers[retailer] = search_with_fallback(scraper, page, product, address, require, exclude)
-            except Exception as e:
-                print(f"  {retailer} scrape failed: {e}", file=sys.stderr)
-                all_offers[retailer] = []
-            finally:
-                page.close()
-        browser.close()
+    all_offers = asyncio.run(run(product, address, require, exclude))
 
     if extract_size(product) is not None:
         # User already named a size (e.g. "200g") — compare that exact one.
