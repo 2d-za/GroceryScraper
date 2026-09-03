@@ -11,7 +11,14 @@ headless browser (Playwright) rather than plain HTTP requests:
     price on a promotion may still differ from the "SAVE"/limited-item deal
     price shown in the promo badge.
 
+Run it with no arguments and it will prompt for a delivery address and a
+product to search for. If the product doesn't mention a size (e.g. just
+"Jacobs Gold Instant Coffee" instead of "...200g"), it compares the two
+most common pack sizes found across the three stores instead of guessing
+which one you meant.
+
 Usage:
+    py ComparePrices.py
     py ComparePrices.py "Jacobs Gold Instant Coffee 200g"
     py ComparePrices.py "Jacobs Gold Instant Coffee 200g" --address "1 Sandton Drive, Sandton"
     py ComparePrices.py "Jacobs Gold Instant Coffee 200g" --require gold 200g --exclude refill kronung stick sachet decaf
@@ -21,6 +28,7 @@ import argparse
 import re
 import sys
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
@@ -68,6 +76,36 @@ def pick_best_match(offers: list[Offer], require: list[str], exclude: list[str])
         if all(r in low for r in require) and not any(e in low for e in exclude):
             return offer
     return None
+
+
+SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)(kg|g|ml|l)\b")
+
+
+def extract_size(name: str) -> str | None:
+    m = SIZE_RE.search(normalize_for_match(name))
+    return f"{m.group(1)}{m.group(2)}" if m else None
+
+
+def rank_sizes(all_offers: dict[str, list[Offer]], require: list[str], exclude: list[str], limit: int = 2) -> list[str]:
+    """Pack sizes among offers matching require/exclude, ranked by how many
+    different stores carry that size (most useful for cross-store comparison)
+    and, as a tiebreak, how often it shows up overall."""
+    req = [normalize_for_match(r) for r in require]
+    exc = [normalize_for_match(e) for e in exclude]
+    stores_by_size: dict[str, set] = {}
+    counts: Counter[str] = Counter()
+    for retailer, offers in all_offers.items():
+        for offer in offers:
+            low = normalize_for_match(offer.name)
+            if not all(r in low for r in req) or any(e in low for e in exc):
+                continue
+            size = extract_size(offer.name)
+            if size:
+                stores_by_size.setdefault(size, set()).add(retailer)
+                counts[size] += 1
+    sizes = list(stores_by_size)
+    sizes.sort(key=lambda s: (-len(stores_by_size[s]), -counts[s]))
+    return sizes[:limit]
 
 
 def scrape_checkers(page, query: str, address: str) -> list[Offer]:
@@ -228,41 +266,27 @@ SCRAPERS = {
     "Woolworths": lambda page, query, address: scrape_woolworths(page, query),
 }
 
+DEFAULT_ADDRESS = "1 Sandton Drive, Sandton"
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Compare a grocery product's price across Checkers, Pick n Pay, and Woolworths."
-    )
-    parser.add_argument("product", help='Product to search for, e.g. "Jacobs Gold Instant Coffee 200g"')
-    parser.add_argument("--address", default="1 Sandton Drive, Sandton",
-                         help="Delivery address for Checkers Sixty60 (affects price/availability)")
-    parser.add_argument("--require", nargs="*", default=None,
-                         help="Words that must all appear in the matched product name (default: every word in the product query)")
-    parser.add_argument("--exclude", nargs="*", default=[],
-                         help="Words that must NOT appear in the matched product name")
-    args = parser.parse_args()
 
-    require = args.require if args.require is not None else re.findall(r"\w+", normalize(args.product))
+def prompt(text: str, default: str | None = None) -> str | None:
+    suffix = f" [{default}]" if default else ""
+    try:
+        value = input(f"{text}{suffix}: ").strip()
+    except EOFError:
+        value = ""
+    return value or default
 
-    matches: list[Offer] = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        for retailer, scraper in SCRAPERS.items():
-            print(f"Checking {retailer} ...")
-            page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1400, "height": 1200})
-            try:
-                offers = scraper(page, args.product, args.address)
-                match = pick_best_match(offers, require, args.exclude)
-                if match:
-                    matches.append(match)
-            except Exception as e:
-                print(f"  {retailer} scrape failed: {e}", file=sys.stderr)
-            finally:
-                page.close()
-        browser.close()
+
+def print_comparison(label: str, all_offers: dict[str, list[Offer]], require: list[str], exclude: list[str]) -> None:
+    matches = []
+    for retailer, offers in all_offers.items():
+        offer = pick_best_match(offers, require, exclude)
+        if offer:
+            matches.append(offer)
 
     print()
-    print(f"Results for: {args.product}")
+    print(f"Results for: {label}")
     print("-" * 70)
     for retailer in SCRAPERS:
         offer = next((m for m in matches if m.retailer == retailer), None)
@@ -287,6 +311,63 @@ def main():
     if on_deal and on_deal[0] is not cheapest:
         for offer in on_deal:
             print(f"Also on deal: {offer.retailer} at R{offer.price:.2f} [{offer.deal_label}]")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compare a grocery product's price across Checkers, Pick n Pay, and Woolworths."
+    )
+    parser.add_argument("product", nargs="?", default=None,
+                         help='Product to search for, e.g. "Jacobs Gold Instant Coffee 200g". '
+                              "Prompted for if omitted.")
+    parser.add_argument("--address", default=None,
+                         help="Delivery address for Checkers Sixty60 (affects price/availability). Prompted for if omitted.")
+    parser.add_argument("--require", nargs="*", default=None,
+                         help="Words that must all appear in the matched product name (default: every word in the product query)")
+    parser.add_argument("--exclude", nargs="*", default=[],
+                         help="Words that must NOT appear in the matched product name")
+    args = parser.parse_args()
+
+    address = args.address or prompt(
+        "Delivery address (Checkers needs one to show real prices)", DEFAULT_ADDRESS
+    )
+    product = args.product or prompt("Product to search for (e.g. 'Jacobs Gold Instant Coffee')")
+    if not product:
+        print("No product entered.", file=sys.stderr)
+        sys.exit(1)
+
+    require = args.require if args.require is not None else re.findall(r"\w+", normalize(product))
+    exclude = args.exclude
+
+    all_offers: dict[str, list[Offer]] = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        for retailer, scraper in SCRAPERS.items():
+            print(f"Checking {retailer} ...")
+            page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1400, "height": 1200})
+            try:
+                all_offers[retailer] = scraper(page, product, address)
+            except Exception as e:
+                print(f"  {retailer} scrape failed: {e}", file=sys.stderr)
+                all_offers[retailer] = []
+            finally:
+                page.close()
+        browser.close()
+
+    if extract_size(product) is not None:
+        # User already named a size (e.g. "200g") — compare that exact one.
+        print_comparison(product, all_offers, require, exclude)
+        return
+
+    sizes = rank_sizes(all_offers, require, exclude, limit=2)
+    if not sizes:
+        print("\nNo pack size could be detected in the results — showing the single best match per store instead.")
+        print_comparison(product, all_offers, require, exclude)
+        return
+
+    print(f"\nNo size specified — comparing the {len(sizes)} most common pack size(s) found: {', '.join(sizes)}")
+    for size in sizes:
+        print_comparison(f"{product} ({size})", all_offers, require + [size], exclude)
 
 
 if __name__ == "__main__":
