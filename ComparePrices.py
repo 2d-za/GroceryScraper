@@ -215,30 +215,39 @@ async def scrape_checkers(
     await page.goto("https://www.checkers.co.za/", wait_until="networkidle", timeout=30000)
     await accept_cookies(page)
 
-    await page.click("text=Enter your address", timeout=10000)
-    await page.wait_for_timeout(800)
-    addr_input = page.locator("input[type='text']").first
-    await addr_input.click()
-    await addr_input.type(address, delay=80)
+    # search_with_fallback re-navigates to the homepage on retry, but
+    # Checkers remembers the address for the rest of the session — so on a
+    # retry the "Enter your address" prompt is simply gone, and clicking it
+    # would burn the full timeout waiting for something that will never
+    # appear. Only run the entry flow when that prompt is actually present.
+    try:
+        await page.click("text=Enter your address", timeout=3000)
+    except PWTimeoutError:
+        pass
+    else:
+        await page.wait_for_timeout(800)
+        addr_input = page.locator("input[type='text']").first
+        await addr_input.click()
+        await addr_input.type(address, delay=80)
 
-    # Scoped to the actual autocomplete dropdown (an unscoped "li, [role=option]"
-    # locator also matches unrelated <li> elements elsewhere on the page, e.g.
-    # footer nav links) — take the top prediction rather than text-matching it,
-    # since the site's suggestion formatting ("Street, Suburb, City, Country")
-    # rarely matches whatever format the user typed the address in.
-    suggestion = page.locator(
-        "[class*='address-search_address-dropdown'] li[class*='prediction-list-item']"
-    ).first
-    await suggestion.wait_for(state="visible", timeout=10000)
-    await suggestion.click(timeout=8000)
-    await page.wait_for_timeout(1500)
+        # Scoped to the actual autocomplete dropdown (an unscoped "li, [role=option]"
+        # locator also matches unrelated <li> elements elsewhere on the page, e.g.
+        # footer nav links) — take the top prediction rather than text-matching it,
+        # since the site's suggestion formatting ("Street, Suburb, City, Country")
+        # rarely matches whatever format the user typed the address in.
+        suggestion = page.locator(
+            "[class*='address-search_address-dropdown'] li[class*='prediction-list-item']"
+        ).first
+        await suggestion.wait_for(state="visible", timeout=10000)
+        await suggestion.click(timeout=8000)
+        await page.wait_for_timeout(1500)
 
     search_box = page.locator("input[placeholder*='Search']").first
     await search_box.click()
     await search_box.fill(query)
     await search_box.press("Enter")
     try:
-        await page.wait_for_selector("a[data-testid$='-product-card-link']", timeout=15000)
+        await page.wait_for_selector("a[data-testid$='-product-card-link']", timeout=25000)
     except PWTimeoutError:
         return []
 
@@ -295,7 +304,7 @@ async def scrape_pnp(page: Page, query: str, *_ignored) -> list[Offer]:
     await search_box.fill(query)
     await search_box.press("Enter")
     try:
-        await page.wait_for_selector("div.product-grid-item", timeout=15000)
+        await page.wait_for_selector("div.product-grid-item", timeout=25000)
     except PWTimeoutError:
         return []
 
@@ -348,7 +357,7 @@ async def scrape_woolworths(page: Page, query: str, *_ignored) -> list[Offer]:
     await page.goto(url, timeout=30000, wait_until="domcontentloaded")
     await accept_cookies(page)
     try:
-        await page.wait_for_selector("[data-testid='product-card']", timeout=15000)
+        await page.wait_for_selector("[data-testid='product-card']", timeout=25000)
     except PWTimeoutError:
         return []
 
@@ -427,7 +436,15 @@ async def search_with_fallback(
     """Some sites' own search boxes handle certain phrasings (extra qualifier
     words, pack counts, etc.) poorly and return nothing useful even though the
     product exists. If the first search doesn't produce a client-side match,
-    retry once with the last word dropped (repeated down to two words).
+    retry ONE time with the last word dropped.
+
+    This is deliberately capped at a single retry: a full retry means another
+    complete navigation+search cycle (potentially 15-25s), and in practice a
+    failed first attempt is usually caused by transient slowness (three sites
+    scraping concurrently competing for CPU) rather than the query itself —
+    retrying repeatedly under those conditions just adds more concurrent load
+    and makes the slowness worse for every other site scraping at the same
+    time, not better.
 
     scroll_require/scroll_exclude are separate from require/exclude: they
     control Checkers' early-exit-while-scrolling and must be None whenever
@@ -439,16 +456,13 @@ async def search_with_fallback(
         return offers
 
     words = product.split()
-    while len(words) > 2:
-        words = words[:-1]
-        fallback_query = " ".join(words)
+    if len(words) > 2:
+        fallback_query = " ".join(words[:-1])
         try:
             fallback_offers = await scraper(page, fallback_query, address, scroll_require, scroll_exclude)
         except Exception:
-            continue
+            fallback_offers = []
         offers = offers + fallback_offers
-        if pick_best_match(offers, require, exclude):
-            break
     return offers
 
 
