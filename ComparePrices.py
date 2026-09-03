@@ -140,7 +140,19 @@ def scrape_checkers(page, query: str, address: str) -> list[Offer]:
     search_box.press("Enter")
     page.wait_for_timeout(4000)
 
+    # Checkers lazy-loads results via infinite scroll — often only ~16-20 of
+    # potentially hundreds of matches are in the DOM until you scroll, so a
+    # relevant product ranked just past that first batch would be missed.
     links = page.locator("a[data-testid$='-product-card-link']")
+    previous_count = -1
+    for _ in range(6):
+        current_count = links.count()
+        if current_count == previous_count:
+            break
+        previous_count = current_count
+        page.mouse.wheel(0, 4000)
+        page.wait_for_timeout(1200)
+
     offers = []
     for i in range(links.count()):
         link = links.nth(i)
