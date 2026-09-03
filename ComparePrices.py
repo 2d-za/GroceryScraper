@@ -128,9 +128,16 @@ def scrape_checkers(page, query: str, address: str) -> list[Offer]:
     addr_input = page.locator("input[type='text']").first
     addr_input.click()
     addr_input.type(address, delay=80)
-    page.wait_for_timeout(2000)
 
-    suggestion = page.locator("li, [role='option']").filter(has_text=address.split(",")[0]).first
+    # Scoped to the actual autocomplete dropdown (an unscoped "li, [role=option]"
+    # locator also matches unrelated <li> elements elsewhere on the page, e.g.
+    # footer nav links) — take the top prediction rather than text-matching it,
+    # since the site's suggestion formatting ("Street, Suburb, City, Country")
+    # rarely matches whatever format the user typed the address in.
+    suggestion = page.locator(
+        "[class*='address-search_address-dropdown'] li[class*='prediction-list-item']"
+    ).first
+    suggestion.wait_for(state="visible", timeout=10000)
     suggestion.click(timeout=8000)
     page.wait_for_timeout(1500)
 
