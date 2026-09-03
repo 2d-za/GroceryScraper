@@ -1,143 +1,181 @@
 """
-Compares the price of a grocery product between Checkers (checkers.co.za)
-and Pick n Pay (pnp.co.za) by driving a real headless browser, since both
-sites render search results client-side and Checkers sits behind AWS WAF
-bot protection that plain HTTP requests can't get past.
+Compares the price of a grocery product between Checkers Sixty60
+(checkers.co.za) and Pick n Pay (pnp.co.za).
+
+Both sites render their catalogs client-side and gate real prices behind a
+delivery location, so this uses Playwright (a real headless browser) rather
+than plain HTTP requests:
+  - Checkers requires a delivery address to be set before it shows prices.
+  - Pick n Pay shows a "delivery details" prompt that can be dismissed with
+    "Do this later" to browse at default/national pricing.
 
 Usage:
-    python ComparePrices.py "Jacobs Gold Instant Coffee 200g"
-
-Requires: pip install playwright && playwright install chromium
+    py ComparePrices.py "Jacobs Gold Instant Coffee 200g"
+    py ComparePrices.py "Jacobs Gold Instant Coffee 200g" --address "1 Sandton Drive, Sandton"
+    py ComparePrices.py "Jacobs Gold Instant Coffee 200g" --require gold 200g --exclude refill kronung stick sachet decaf
 """
 
 import argparse
 import re
 import sys
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-PRICE_RE = re.compile(r"R\s?\d[\d,]*\.\d{2}")
+
+def accept_cookies(page):
+    for text in ["Accept", "Accept All", "I Accept"]:
+        try:
+            page.click(f"text={text}", timeout=3000)
+            return
+        except PWTimeoutError:
+            continue
 
 
-def clean_price(text: str) -> float | None:
-    # Some sites render "R204" and ".99" as separate text nodes, so strip
-    # whitespace between digits/decimal rather than just collapsing it.
-    flattened = re.sub(r"\s+", "", text.replace("\xa0", " "))
-    match = PRICE_RE.search(flattened)
-    if not match:
-        return None
-    return float(match.group(0).replace("R", "").replace(",", "").strip())
+def pick_best_match(candidates, require, exclude):
+    require = [r.lower() for r in require]
+    exclude = [e.lower() for e in exclude]
+    for name, price in candidates:
+        low = name.lower()
+        if all(r in low for r in require) and not any(e in low for e in exclude):
+            return name, price
+    return None
 
 
-def matches_product(name: str, terms: list[str], exclude: list[str]) -> bool:
-    lowered = name.lower()
-    return all(t in lowered for t in terms) and not any(x in lowered for x in exclude)
+def scrape_checkers(page, query, address):
+    page.goto("https://www.checkers.co.za/", wait_until="networkidle", timeout=30000)
+    accept_cookies(page)
 
+    page.click("text=Enter your address", timeout=10000)
+    page.wait_for_timeout(800)
+    addr_input = page.locator("input[type='text']").first
+    addr_input.click()
+    addr_input.type(address, delay=80)
+    page.wait_for_timeout(2000)
 
-def scrape_checkers(page, query: str, terms: list[str], exclude: list[str]) -> list[dict]:
-    url = f"https://www.checkers.co.za/search?Search={query.replace(' ', '%20')}"
-    page.goto(url, timeout=30000, wait_until="domcontentloaded")
+    suggestion = page.locator("li, [role='option']").filter(has_text=address.split(",")[0]).first
+    suggestion.click(timeout=8000)
+    page.wait_for_timeout(1500)
+
+    search_box = page.locator("input[placeholder*='Search']").first
+    search_box.click()
+    search_box.fill(query)
+    search_box.press("Enter")
     page.wait_for_timeout(4000)
 
+    cards = page.locator("a[data-testid$='-product-card-link']")
+    count = cards.count()
     results = []
-    links = page.locator("a[data-testid*='product-card-link']")
-    for i in range(links.count()):
-        link = links.nth(i)
-        name = link.get_attribute("aria-label") or ""
-        if not matches_product(name, terms, exclude):
-            continue
-        href = link.get_attribute("href") or ""
-        card_text = link.evaluate(
-            "el => el.closest('[class*=product-card]')?.innerText || ''"
+    for i in range(count):
+        card = cards.nth(i)
+        name = card.get_attribute("aria-label") or ""
+        container = card.locator(
+            "xpath=following-sibling::div[contains(@class,'product-card_container')]"
         )
-        price = clean_price(card_text)
-        if price is None:
-            continue
-        results.append({
-            "retailer": "Checkers",
-            "name": name,
-            "price": price,
-            "url": f"https://www.checkers.co.za{href}" if href.startswith("/") else href,
-        })
+        try:
+            whole = container.locator("[class*='price-display_full']").first.inner_text(timeout=1000)
+            cents = container.locator("[class*='price-display_half']").first.inner_text(timeout=1000)
+            price = f"{whole}{cents}"
+        except PWTimeoutError:
+            price = None
+        if name and price:
+            results.append((name.strip(), price.strip()))
     return results
 
 
-def scrape_pnp(page, query: str, terms: list[str], exclude: list[str]) -> list[dict]:
-    url = f"https://www.pnp.co.za/search/{query.replace(' ', '%20')}"
-    page.goto(url, timeout=30000, wait_until="domcontentloaded")
+def scrape_pnp(page, query):
+    page.goto("https://www.pnp.co.za/", wait_until="networkidle", timeout=30000)
+    accept_cookies(page)
+    page.wait_for_timeout(800)
+    try:
+        page.click("text=Do this later", timeout=5000)
+    except PWTimeoutError:
+        pass
+    page.wait_for_timeout(800)
+
+    search_box = page.locator("input[placeholder*='Search']").first
+    search_box.click()
+    search_box.fill(query)
+    search_box.press("Enter")
     page.wait_for_timeout(4000)
 
+    cards = page.locator("div.product-grid-item")
+    count = cards.count()
     results = []
-    links = page.locator("a.product-grid-item__info-container__name")
-    for i in range(links.count()):
-        link = links.nth(i)
-        name = (link.inner_text() or "").strip()
-        if not matches_product(name, terms, exclude):
-            continue
-        href = link.get_attribute("href") or ""
-        card = link.evaluate(
-            "el => el.closest('.product-grid-item')?.innerText "
-            "|| el.closest('[class*=product-grid-item]')?.innerText || ''"
-        )
-        flattened = re.sub(r"\s+", "", card)
-        prices = [clean_price(p) for p in PRICE_RE.findall(flattened)]
-        prices = [p for p in prices if p is not None]
-        if not prices:
-            continue
-        # The lower of the listed prices is the one actually charged
-        # (promotional / Smart Shopper price undercuts the list price).
-        price = min(prices)
-        results.append({
-            "retailer": "Pick n Pay",
-            "name": name,
-            "price": price,
-            "url": f"https://www.pnp.co.za{href}" if href.startswith("/") else href,
-        })
+    for i in range(count):
+        card = cards.nth(i)
+        name = card.get_attribute("aria-label") or ""
+        desc = card.get_attribute("aria-description") or ""
+        m = re.search(r"([\d.]+)\s*rands", desc)
+        price = f"R{m.group(1)}" if m else None
+        if name and price:
+            results.append((name.strip(), price.strip()))
     return results
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare a product's price between Checkers and Pick n Pay.")
+def main():
+    parser = argparse.ArgumentParser(description="Compare a grocery product's price between Checkers and Pick n Pay.")
     parser.add_argument("product", help='Product to search for, e.g. "Jacobs Gold Instant Coffee 200g"')
+    parser.add_argument("--address", default="1 Sandton Drive, Sandton",
+                         help="Delivery address for Checkers Sixty60 (affects price/availability)")
+    parser.add_argument("--require", nargs="*", default=None,
+                         help="Words that must all appear in the matched product name (default: every word in the product query)")
+    parser.add_argument("--exclude", nargs="*", default=[],
+                         help="Words that must NOT appear in the matched product name")
     args = parser.parse_args()
 
-    query = args.product
-    # Loose matching: require every significant word, ignore pack-size/variant noise.
-    words = [w.lower() for w in re.findall(r"[A-Za-z0-9]+", query)]
-    terms = [w for w in words if w not in ("instant", "coffee")]
-    exclude = ["kronung", "decaf", "stick", "refill", "6 x", "x 6"]
+    require = args.require if args.require is not None else [w.lower() for w in re.findall(r"\w+", args.product)]
 
-    all_results = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        for scraper in (scrape_checkers, scrape_pnp):
-            page = browser.new_page(user_agent=USER_AGENT)
-            try:
-                all_results.extend(scraper(page, query, terms, exclude))
-            except Exception as error:
-                print(f"Warning: {scraper.__name__} failed: {error}", file=sys.stderr)
-            finally:
-                page.close()
+
+        print(f"Checking Checkers Sixty60 (delivering to: {args.address}) ...")
+        page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1400, "height": 1200})
+        try:
+            checkers_results = scrape_checkers(page, args.product, args.address)
+        except Exception as e:
+            print(f"  Checkers scrape failed: {e}", file=sys.stderr)
+            checkers_results = []
+        page.close()
+
+        print("Checking Pick n Pay ...")
+        page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1400, "height": 1200})
+        try:
+            pnp_results = scrape_pnp(page, args.product)
+        except Exception as e:
+            print(f"  Pick n Pay scrape failed: {e}", file=sys.stderr)
+            pnp_results = []
+        page.close()
+
         browser.close()
 
-    if not all_results:
-        print("No matching products found on either site.", file=sys.stderr)
-        sys.exit(1)
+    checkers_match = pick_best_match(checkers_results, require, args.exclude)
+    pnp_match = pick_best_match(pnp_results, require, args.exclude)
 
-    all_results.sort(key=lambda r: r["price"])
-    print(f"\nResults for '{query}':\n")
-    for r in all_results:
-        print(f"{r['retailer']:<12} R{r['price']:>7.2f}   {r['name']}")
-        print(f"{'':<12} {r['url']}")
     print()
+    print(f"Results for: {args.product}")
+    print("-" * 60)
+    if checkers_match:
+        print(f"Checkers (Sixty60): {checkers_match[1]}  —  {checkers_match[0]}")
+    else:
+        print("Checkers (Sixty60): no confident match found")
+    if pnp_match:
+        print(f"Pick n Pay:         {pnp_match[1]}  —  {pnp_match[0]}")
+    else:
+        print("Pick n Pay:         no confident match found")
 
-    cheapest = all_results[0]
-    print(f"Cheapest: {cheapest['retailer']} at R{cheapest['price']:.2f}")
+    if checkers_match and pnp_match:
+        def to_float(p):
+            return float(p.replace("R", "").replace(",", "").strip())
+        c_price, p_price = to_float(checkers_match[1]), to_float(pnp_match[1])
+        diff = abs(c_price - p_price)
+        cheaper = "Checkers" if c_price < p_price else ("Pick n Pay" if p_price < c_price else "Neither (tied)")
+        print("-" * 60)
+        print(f"Cheaper: {cheaper} (by R{diff:.2f})" if diff else "Prices are equal")
 
 
 if __name__ == "__main__":
