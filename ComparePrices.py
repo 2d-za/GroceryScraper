@@ -29,6 +29,15 @@ Usage:
     py ComparePrices.py "Jacobs Gold Instant Coffee 200g"
     py ComparePrices.py "Jacobs Gold Instant Coffee 200g" --address "1 Sandton Drive, Sandton"
     py ComparePrices.py "Jacobs Gold Instant Coffee 200g" --require gold 200g --exclude refill kronung stick sachet decaf
+    py ComparePrices.py "Joko Teabags 100 Pack" --debug
+
+--debug: whenever a store comes back with zero offers, saves a screenshot
+of its page at that moment plus the URL it was on to ./debug/, and prints
+the path — the go-to check is "was this a real scrape failure (blank
+results, wrong page, address never got set) or something more subtle?".
+It also prints the closest near-miss for stores that DID return offers
+but none passed the matching threshold, so you can see how many
+words it actually matched and on what product name.
 """
 
 import argparse
@@ -39,6 +48,7 @@ import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 
 from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeoutError
 
@@ -151,10 +161,14 @@ def min_required_hits(require: list[str]) -> int:
     return len(require) if len(require) <= 2 else len(require) - 1
 
 
-def offer_matches(name: str, require: list[str], exclude: list[str]) -> bool:
+def is_excluded(name: str, exclude: list[str]) -> bool:
     low = normalize_for_match(name)
     exclude_forms = [f for e in exclude for f in word_variants(e)]
-    if any(f in low for f in exclude_forms):
+    return any(f in low for f in exclude_forms)
+
+
+def offer_matches(name: str, require: list[str], exclude: list[str]) -> bool:
+    if is_excluded(name, exclude):
         return False
     return word_hits(name, require) >= min_required_hits(require)
 
@@ -417,7 +431,9 @@ def prompt(text: str, default: str | None = None) -> str | None:
     return value or default
 
 
-def print_comparison(label: str, all_offers: dict[str, list[Offer]], require: list[str], exclude: list[str]) -> None:
+def print_comparison(
+    label: str, all_offers: dict[str, list[Offer]], require: list[str], exclude: list[str], debug: bool = False
+) -> None:
     matches = []
     for retailer, offers in all_offers.items():
         offer = pick_best_match(offers, require, exclude)
@@ -434,6 +450,22 @@ def print_comparison(label: str, all_offers: dict[str, list[Offer]], require: li
             print(f"{retailer:<12} R{offer.price:>8.2f}{deal}  —  {offer.name}")
         else:
             print(f"{retailer:<12} no confident match found")
+            if debug:
+                offers = all_offers.get(retailer, [])
+                if not offers:
+                    print("             [debug] scrape returned 0 offers — see ./debug/ for a screenshot")
+                else:
+                    candidates = [o for o in offers if not is_excluded(o.name, exclude)]
+                    if not candidates:
+                        print(f"             [debug] {len(offers)} offers found, all excluded by --exclude")
+                    else:
+                        needed = min_required_hits(require)
+                        closest = max(candidates, key=lambda o: word_hits(o.name, require))
+                        hits = word_hits(closest.name, require)
+                        print(
+                            f"             [debug] {len(offers)} offers found; closest match was "
+                            f"\"{closest.name}\" ({hits}/{len(require)} words, needed {needed})"
+                        )
 
     if not matches:
         print("-" * 70)
@@ -489,27 +521,45 @@ async def search_with_fallback(
     return offers
 
 
+DEBUG_DIR = Path("debug")
+
+
+async def save_debug_snapshot(page: Page, retailer: str) -> None:
+    DEBUG_DIR.mkdir(exist_ok=True)
+    safe_name = re.sub(r"[^a-z0-9]+", "-", retailer.lower()).strip("-")
+    screenshot_path = DEBUG_DIR / f"{safe_name}-{int(time.time())}.png"
+    try:
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+        print(f"  [debug] {retailer}: 0 offers — saved {screenshot_path} (page was at {page.url})", file=sys.stderr)
+    except Exception as e:
+        print(f"  [debug] {retailer}: couldn't capture a debug screenshot: {e}", file=sys.stderr)
+
+
 async def run_retailer(browser, retailer: str, scraper, product: str, address: str,
                         require: list[str], exclude: list[str],
-                        scroll_require: list[str] | None, scroll_exclude: list[str] | None) -> tuple[str, list[Offer]]:
+                        scroll_require: list[str] | None, scroll_exclude: list[str] | None,
+                        debug: bool = False) -> tuple[str, list[Offer]]:
     print(f"Checking {retailer} ...")
     start = time.monotonic()
     page = await new_page(browser)
+    offers: list[Offer] = []
     try:
         offers = await search_with_fallback(
             scraper, page, product, address, require, exclude, scroll_require, scroll_exclude
         )
     except Exception as e:
         print(f"  {retailer} scrape failed: {e}", file=sys.stderr)
-        offers = []
-    finally:
-        await page.close()
+    if debug and not offers:
+        await save_debug_snapshot(page, retailer)
+    await page.close()
     elapsed = time.monotonic() - start
     print(f"  {retailer} done in {elapsed:.1f}s ({len(offers)} offers)")
     return retailer, offers
 
 
-async def run(product: str, address: str, require: list[str], exclude: list[str]) -> dict[str, list[Offer]]:
+async def run(
+    product: str, address: str, require: list[str], exclude: list[str], debug: bool = False
+) -> dict[str, list[Offer]]:
     # Only let Checkers stop scrolling early when the query already names a
     # size — otherwise the later "no size specified" size-ranking needs to
     # see the full result set, not just whatever loaded before the first
@@ -522,7 +572,8 @@ async def run(product: str, address: str, require: list[str], exclude: list[str]
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         results = await asyncio.gather(*(
-            run_retailer(browser, retailer, scraper, product, address, require, exclude, scroll_require, scroll_exclude)
+            run_retailer(browser, retailer, scraper, product, address, require, exclude,
+                         scroll_require, scroll_exclude, debug)
             for retailer, scraper in SCRAPERS.items()
         ))
         await browser.close()
@@ -543,6 +594,9 @@ def main():
                          help="Words that must all appear in the matched product name (default: every word in the product query)")
     parser.add_argument("--exclude", nargs="*", default=[],
                          help="Words that must NOT appear in the matched product name")
+    parser.add_argument("--debug", action="store_true",
+                         help="Save a screenshot to ./debug/ whenever a store returns zero offers, "
+                              "and print the closest near-miss when offers were found but none matched.")
     args = parser.parse_args()
 
     address = args.address or prompt(
@@ -556,22 +610,22 @@ def main():
     require = args.require if args.require is not None else re.findall(r"\w+", normalize(product))
     exclude = args.exclude
 
-    all_offers = asyncio.run(run(product, address, require, exclude))
+    all_offers = asyncio.run(run(product, address, require, exclude, args.debug))
 
     if extract_size(product) is not None:
         # User already named a size (e.g. "200g") — compare that exact one.
-        print_comparison(product, all_offers, require, exclude)
+        print_comparison(product, all_offers, require, exclude, args.debug)
         return
 
     sizes = rank_sizes(all_offers, require, exclude, limit=2)
     if not sizes:
         print("\nNo pack size could be detected in the results — showing the single best match per store instead.")
-        print_comparison(product, all_offers, require, exclude)
+        print_comparison(product, all_offers, require, exclude, args.debug)
         return
 
     print(f"\nNo size specified — comparing the {len(sizes)} most common pack size(s) found: {', '.join(sizes)}")
     for size in sizes:
-        print_comparison(f"{product} ({size})", all_offers, require + [size], exclude)
+        print_comparison(f"{product} ({size})", all_offers, require + [size], exclude, args.debug)
 
 
 if __name__ == "__main__":
