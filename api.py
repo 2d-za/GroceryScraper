@@ -12,7 +12,7 @@ Then POST to /compare, e.g.:
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from comparer import Offer, compare_product
 
@@ -31,6 +31,18 @@ class CompareRequest(BaseModel):
     address: str
     require: list[str] | None = None
     exclude: list[str] = []
+
+    # Without this, Swagger's "Try it out" auto-fills require/exclude with a
+    # generic ["string"] placeholder — if left in, every offer needs the
+    # literal word "string" in its name, so nothing ever matches.
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "product": "Jacobs Gold Instant Coffee 200g",
+            "address": "1 Sandton Drive, Sandton",
+            "require": None,
+            "exclude": [],
+        }
+    })
 
 
 def offer_to_dict(offer: Offer | None) -> dict | None:
