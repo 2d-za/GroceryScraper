@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GroceryScraper</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <h1>Grocery price comparison</h1>
+    <p class="subtitle">Checkers Sixty60, Pick n Pay, and Woolworths — searched live.</p>
+
+    <form id="search-form">
+      <label for="product">Product</label>
+      <input id="product" name="product" type="text" placeholder="Jacobs Gold Instant Coffee 200g" required>
+
+      <label for="address">Delivery address</label>
+      <input id="address" name="address" type="text" placeholder="1 Sandton Drive, Sandton" required>
+
+      <button type="submit" id="submit-btn">Compare prices</button>
+    </form>
+
+    <section id="status" hidden></section>
+    <section id="results"></section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

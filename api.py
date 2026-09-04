@@ -3,18 +3,23 @@ Web backend for comparer.py. Run locally with:
 
     py -m uvicorn api:app --reload
 
-Then POST to /compare, e.g.:
-
-    curl -X POST http://127.0.0.1:8000/compare \\
-        -H "Content-Type: application/json" \\
-        -d '{"product": "Jacobs Gold Instant Coffee 200g", "address": "1 Sandton Drive, Sandton"}'
+Then either:
+  - open http://127.0.0.1:8000/ for the frontend, or
+  - POST to /compare directly, e.g.:
+        curl -X POST http://127.0.0.1:8000/compare \\
+            -H "Content-Type: application/json" \\
+            -d '{"product": "Jacobs Gold Instant Coffee 200g", "address": "1 Sandton Drive, Sandton"}'
 """
 
-from fastapi import FastAPI
+import json
+
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
-from comparer import Offer, compare_product
+from comparer import Offer, compare_product, compare_product_stream
 
 app = FastAPI(title="GroceryScraper API")
 
@@ -57,6 +62,15 @@ def offer_to_dict(offer: Offer | None) -> dict | None:
     }
 
 
+def result_to_dict(r: dict) -> dict:
+    return {
+        "label": r["label"],
+        "matches": {retailer: offer_to_dict(o) for retailer, o in r["matches"].items()},
+        "cheapest": offer_to_dict(r["cheapest"]),
+        "on_deal": [offer_to_dict(o) for o in r["on_deal"]],
+    }
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -65,15 +79,25 @@ async def health():
 @app.post("/compare")
 async def compare(req: CompareRequest):
     results = await compare_product(req.product, req.address, req.require, req.exclude)
-    return {
-        "product": req.product,
-        "results": [
-            {
-                "label": r["label"],
-                "matches": {retailer: offer_to_dict(o) for retailer, o in r["matches"].items()},
-                "cheapest": offer_to_dict(r["cheapest"]),
-                "on_deal": [offer_to_dict(o) for o in r["on_deal"]],
-            }
-            for r in results
-        ],
-    }
+    return {"product": req.product, "results": [result_to_dict(r) for r in results]}
+
+
+@app.get("/compare/stream")
+async def compare_stream(
+    product: str,
+    address: str,
+    require: list[str] | None = Query(None),
+    exclude: list[str] = Query([]),
+):
+    async def events():
+        async for event in compare_product_stream(product, address, require, exclude):
+            if event["type"] == "result":
+                event = {"type": "result", **result_to_dict(event)}
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+# Registered last: an explicit route above always wins for an exact path
+# match, so this only ever serves the frontend's static files.
+app.mount("/", StaticFiles(directory="static", html=True), name="static")

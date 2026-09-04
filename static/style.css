@@ -1,0 +1,113 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --border: #2a2f3a;
+  --text: #e8eaed;
+  --muted: #9aa1ac;
+  --accent: #4f8cff;
+  --deal: #2fbf71;
+  --cheapest: #1f2b1f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  line-height: 1.4;
+}
+
+main {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 40px 20px 80px;
+}
+
+h1 { font-size: 1.6rem; margin-bottom: 4px; }
+.subtitle { color: var(--muted); margin-top: 0; margin-bottom: 28px; }
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+}
+
+label { font-size: 0.85rem; color: var(--muted); margin-top: 10px; }
+label:first-of-type { margin-top: 0; }
+
+input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 1rem;
+}
+
+input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+button {
+  margin-top: 16px;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:disabled { opacity: 0.6; cursor: default; }
+
+#status {
+  margin-top: 24px;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+#status .line { margin: 2px 0; }
+#status .line.done { color: var(--text); }
+
+#results { margin-top: 24px; display: flex; flex-direction: column; gap: 20px; }
+
+.result-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
+}
+
+.result-card h2 { font-size: 1.05rem; margin: 0 0 12px; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+th { color: var(--muted); font-weight: 500; }
+tr:last-child td { border-bottom: none; }
+
+tr.cheapest { background: var(--cheapest); }
+tr.no-match td { color: var(--muted); font-style: italic; }
+
+.price { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.deal-badge {
+  display: inline-block;
+  margin-top: 3px;
+  padding: 1px 7px;
+  background: var(--deal);
+  color: #06210f;
+  border-radius: 10px;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.error { color: #ff6b6b; margin-top: 16px; }

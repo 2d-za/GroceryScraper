@@ -480,19 +480,10 @@ def build_comparison(label: str, all_offers: dict[str, list[Offer]], require: li
     }
 
 
-async def compare_product(
-    product: str, address: str,
-    require: list[str] | None = None, exclude: list[str] | None = None,
-    debug: bool = False,
-) -> list[dict]:
-    """Scrapes all three stores and returns one or two build_comparison()
-    results — two when the query has no size and multiple comparable sizes
-    were found, one otherwise."""
-    require = require if require is not None else default_require(product)
-    exclude = exclude or []
-
-    all_offers = await run(product, address, require, exclude, debug)
-
+def build_comparisons(product: str, all_offers: dict[str, list[Offer]], require: list[str], exclude: list[str]) -> list[dict]:
+    """One or two build_comparison() results for a scraped product — two
+    when the query has no size and multiple comparable sizes were found,
+    one otherwise."""
     if extract_size(product) is not None:
         return [build_comparison(product, all_offers, require, exclude)]
 
@@ -504,3 +495,59 @@ async def compare_product(
         build_comparison(f"{product} ({size})", all_offers, require + [size], exclude)
         for size in sizes
     ]
+
+
+async def compare_product(
+    product: str, address: str,
+    require: list[str] | None = None, exclude: list[str] | None = None,
+    debug: bool = False,
+) -> list[dict]:
+    """Scrapes all three stores and returns the comparison result(s)."""
+    require = require if require is not None else default_require(product)
+    exclude = exclude or []
+    all_offers = await run(product, address, require, exclude, debug)
+    return build_comparisons(product, all_offers, require, exclude)
+
+
+async def compare_product_stream(
+    product: str, address: str,
+    require: list[str] | None = None, exclude: list[str] | None = None,
+    debug: bool = False,
+):
+    """Same as compare_product, but an async generator: yields a {"type":
+    "status", ...} event as each store finishes scraping (mirrors the CLI's
+    "X done in Ys (N offers)" line), then {"type": "result", ...} for each
+    comparison once all three are in, then a final {"type": "done", ...}.
+
+    Genuinely live per-store prices aren't possible here: picking which
+    pack size to compare needs all three stores' offers first, so the
+    actual comparison can only be computed once scraping finishes — the
+    status events exist so the wait isn't a dead spinner."""
+    require = require if require is not None else default_require(product)
+    exclude = exclude or []
+
+    has_size = extract_size(product) is not None
+    scroll_require = require if has_size else None
+    scroll_exclude = exclude if has_size else None
+
+    all_offers: dict[str, list[Offer]] = {}
+    start = time.monotonic()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        tasks = [
+            asyncio.create_task(run_retailer(
+                browser, retailer, scraper, product, address, require, exclude,
+                scroll_require, scroll_exclude, debug
+            ))
+            for retailer, scraper in SCRAPERS.items()
+        ]
+        for coro in asyncio.as_completed(tasks):
+            retailer, offers = await coro
+            all_offers[retailer] = offers
+            yield {"type": "status", "retailer": retailer, "offers": len(offers)}
+        await browser.close()
+
+    for comparison in build_comparisons(product, all_offers, require, exclude):
+        yield {"type": "result", **comparison}
+
+    yield {"type": "done", "elapsed": time.monotonic() - start}
