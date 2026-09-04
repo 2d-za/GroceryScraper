@@ -356,15 +356,33 @@ async def scrape_pnp(page: Page, query: str, *_ignored) -> list[Offer]:
         regular_price = float(m.group(1))
 
         deal_price = None
-        if item.get("promoPrice"):
-            pm = re.search(r"[\d.]+", item["promoPrice"])
-            if pm:
-                deal_price = float(pm.group(0))
+        deal_text = None
+        promo_text = item.get("promoPrice")
+        if promo_text:
+            # "N for RXX.XX" bundle deals (e.g. "2 for R38.00") need dividing
+            # down to a per-unit price for a fair comparison — grabbing the
+            # first number in the string would catch the "2", not R38.00.
+            bundle_m = re.search(r"(\d+)\s*for\s*R\s?([\d,]+(?:\.\d{2})?)", promo_text, re.I)
+            if bundle_m:
+                qty = int(bundle_m.group(1))
+                total = float(bundle_m.group(2).replace(",", ""))
+                if qty > 0:
+                    deal_price = total / qty
+                    deal_text = f"{promo_text.strip()} (R{deal_price:.2f} each)"
+            else:
+                price_m = re.search(r"R\s?([\d,]+(?:\.\d{2})?)", promo_text)
+                if price_m:
+                    deal_price = float(price_m.group(1).replace(",", ""))
+                    deal_text = promo_text.strip()
 
         price = deal_price if deal_price is not None else regular_price
         deal_label = None
         if deal_price is not None and deal_price < regular_price:
-            deal_label = item.get("badgeLabel") or "On promotion"
+            badge_label = item.get("badgeLabel")
+            if badge_label and deal_text:
+                deal_label = f"{badge_label}: {deal_text}"
+            else:
+                deal_label = deal_text or badge_label or "On promotion"
 
         href = item.get("href") or ""
         offers.append(Offer(
