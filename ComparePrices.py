@@ -419,9 +419,6 @@ SCRAPERS = {
     "Woolworths": scrape_woolworths,
 }
 
-DEFAULT_ADDRESS = "1 Sandton Drive, Sandton"
-
-
 def prompt(text: str, default: str | None = None) -> str | None:
     suffix = f" [{default}]" if default else ""
     try:
@@ -599,10 +596,11 @@ def main():
                               "and print the closest near-miss when offers were found but none matched.")
     args = parser.parse_args()
 
-    address = args.address or prompt(
-        "Delivery address (Checkers needs one to show real prices)", DEFAULT_ADDRESS
-    )
-    product = args.product or prompt("Product to search for (e.g. 'Jacobs Gold Instant Coffee')")
+    address = args.address or prompt("Delivery address (Checkers needs one to show real prices)")
+    product = args.product or prompt("Product to search for")
+    if not address:
+        print("No delivery address entered.", file=sys.stderr)
+        sys.exit(1)
     if not product:
         print("No product entered.", file=sys.stderr)
         sys.exit(1)
